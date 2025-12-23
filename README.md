@@ -51,4 +51,8 @@ See [requirements.txt](requirements.txt) for the full list.
 
 ## 🤖 Model
 
+<<<<<<< HEAD
 This application uses *DeepSeek-OCR*, a specialized multimodal model designed for high-accuracy text extraction and document understanding.
+=======
+This application uses *DeepSeek-OCR*, a specialized multimodal model designed for high-accuracy text extraction and document understanding.
+>>>>>>> f69c3dbc9ec093819cec1ead439318116a2c19a0
