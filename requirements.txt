@@ -3,9 +3,12 @@ transformers==4.46.3
 tokenizers==0.20.3
 accelerate
 einops
-addict 
+addict
 easydict
 torchvision
 PyMuPDF
 hf_transfer
 spaces
+gradio>=6.0
+Pillow
+numpy

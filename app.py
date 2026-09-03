@@ -1,349 +1,401 @@
 import os
-import re
-import sys
-import fitz
-import torch
-import shutil
-import spaces
-import base64
-import tempfile
-import warnings
-import numpy as np
 import gradio as gr
-from io import StringIO, BytesIO
-from transformers import AutoModel, AutoTokenizer
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+import spaces
+from ocr_core.config import MODEL_CONFIGS, TASK_PROMPTS
+from ocr_core.document_service import DocumentService
+from ocr_core.model_service import OCRModelService
 
-MODEL_NAME = 'deepseek-ai/DeepSeek-OCR'
+document_service = DocumentService()
+ocr_service = OCRModelService()
 
-# Load tokenizer & model
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+def update_prompt(task):
+    if task == "Custom":
+        return gr.update(visible=True, label="Custom Prompt", placeholder="Use <|grounding|> to detect bounding boxes")
+    if task == "Locate":
+        return gr.update(visible=True, label="Target Text to Locate", placeholder="e.g. Invoice Number, Total Amount")
+    return gr.update(visible=False, value="")
 
-model = AutoModel.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.bfloat16,
-    trust_remote_code=True,
-    use_safetensors=True,
-)
-model = model.eval().cuda()
-
-#  SAFE FONT LOADING 
-def load_font(size=30):
-    try:
-        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
-    except:
-        return ImageFont.load_default()
-
-#  CONFIG 
-MODEL_CONFIGS = {
-    "Gundam": {"base_size": 1024, "image_size": 640, "crop_mode": True},
-    "Tiny": {"base_size": 512, "image_size": 512, "crop_mode": False},
-    "Small": {"base_size": 640, "image_size": 640, "crop_mode": False},
-    "Base": {"base_size": 1024, "image_size": 1024, "crop_mode": False},
-    "Large": {"base_size": 1280, "image_size": 1280, "crop_mode": False}
-}
-
-TASK_PROMPTS = {
-    "📋 Markdown": {"prompt": "<image>\n<|grounding|>Convert the document to markdown.", "has_grounding": True},
-    "📝 Free OCR": {"prompt": "<image>\nFree OCR.", "has_grounding": False},
-    "📍 Locate": {"prompt": "<image>\nLocate <|ref|>text<|/ref|> in the image.", "has_grounding": True},
-    "🔍 Describe": {"prompt": "<image>\nDescribe this image in detail.", "has_grounding": False},
-    "✏️ Custom": {"prompt": "", "has_grounding": False}
-}
-
-#  EXTRACTION 
-def extract_grounding_references(text):
-    pattern = r'(<\|ref\|>(.*?)<\|/ref\|><\|det\|>(.*?)<\|/det\|>)'
-    return re.findall(pattern, text, re.DOTALL)
-
-def draw_bounding_boxes(image, refs, extract_images=False):
-    img_w, img_h = image.size
-    img_draw = image.copy()
-    draw = ImageDraw.Draw(img_draw)
-    overlay = Image.new('RGBA', img_draw.size, (0, 0, 0, 0))
-    draw2 = ImageDraw.Draw(overlay)
-    font = load_font(30)
-
-    crops = []
-    color_map = {}
-    np.random.seed(42)
-
-    for ref in refs:
-        label = ref[1]
-        if label not in color_map:
-            color_map[label] = (
-                np.random.randint(50, 255),
-                np.random.randint(50, 255),
-                np.random.randint(50, 255)
-            )
-
-        color = color_map[label]
-        coords = eval(ref[2])
-        color_a = color + (60,)
-
-        for box in coords:
-            x1 = int(box[0] / 999 * img_w)
-            y1 = int(box[1] / 999 * img_h)
-            x2 = int(box[2] / 999 * img_w)
-            y2 = int(box[3] / 999 * img_h)
-
-            if extract_images and label == 'image':
-                crops.append(image.crop((x1, y1, x2, y2)))
-
-            width = 5 if label == 'title' else 3
-
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
-            draw2.rectangle([x1, y1, x2, y2], fill=color_a)
-
-            text_bbox = draw.textbbox((0, 0), label, font=font)
-            tw, th = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
-            ty = max(0, y1 - 20)
-            draw.rectangle([x1, ty, x1 + tw + 4, ty + th + 4], fill=color)
-            draw.text((x1 + 2, ty + 2), label, font=font, fill=(255, 255, 255))
-
-    img_draw.paste(overlay, (0, 0), overlay)
-    return img_draw, crops
-
-def clean_output(text, include_images=False):
-    if not text:
-        return ""
-    pattern = r'(<\|ref\|>(.*?)<\|/ref\|><\|det\|>(.*?)<\|/det\|>)'
-    matches = re.findall(pattern, text, re.DOTALL)
-    img_num = 0
-    for match in matches:
-        if '<|ref|>image<|/ref|>' in match[0]:
-            if include_images:
-                text = text.replace(match[0], f'\n\n**[Figure {img_num + 1}]**\n\n', 1)
-                img_num += 1
-            else:
-                text = text.replace(match[0], '', 1)
-        else:
-            text = re.sub(rf'(?m)^[^\n]*{re.escape(match[0])}[^\n]*\n?', '', text)
-    return text.strip()
-
-def embed_images(markdown, crops):
-    if not crops:
-        return markdown
-    for i, img in enumerate(crops):
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        markdown = markdown.replace(
-            f'**[Figure {i+1}]**',
-            f'\n\n![Figure {i+1}](data:image/png;base64,{b64})\n\n', 1)
-    return markdown
-
-#  MAIN INFERENCE 
-@spaces.GPU(duration=60)
-def process_image(image, mode, task, custom_prompt):
-    if image is None:
-        return "Upload image", "", "", None, []
-
-    if task in ["✏️ Custom", "📍 Locate"] and not custom_prompt.strip():
-        return "Enter prompt", "", "", None, []
-
-    if image.mode in ('RGBA', 'LA', 'P'):
-        image = image.convert('RGB')
-    image = ImageOps.exif_transpose(image)
-
-    config = MODEL_CONFIGS[mode]
-
-    if task == "✏️ Custom":
-        prompt = f"<image>\n{custom_prompt.strip()}"
-        has_grounding = '<|grounding|>' in custom_prompt
-    elif task == "📍 Locate":
-        prompt = f"<image>\nLocate <|ref|>{custom_prompt.strip()}<|/ref|> in the image."
-        has_grounding = True
-    else:
-        prompt = TASK_PROMPTS[task]["prompt"]
-        has_grounding = TASK_PROMPTS[task]["has_grounding"]
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-    image.save(tmp.name, "JPEG", quality=95)
-    tmp.close()
-
-    out_dir = tempfile.mkdtemp()
-
-    stdout = sys.stdout
-    sys.stdout = StringIO()
-
-    model.infer(
-        tokenizer=tokenizer,
-        prompt=prompt,
-        image_file=tmp.name,
-        output_path=out_dir,
-        base_size=config["base_size"],
-        image_size=config["image_size"],
-        crop_mode=config["crop_mode"],
-    )
-
-    raw_output = sys.stdout.getvalue()
-    sys.stdout = stdout
-
-    result = "\n".join([
-        l for l in raw_output.split("\n")
-        if not any(s in l for s in ["image:", "other:", "PATCHES", "====", "BASE:", "%|", "torch.Size"])
-    ]).strip()
-
-    os.unlink(tmp.name)
-    shutil.rmtree(out_dir, ignore_errors=True)
-
-    if not result:
-        return "No text extracted", "", "", None, []
-
-    cleaned = clean_output(result, False)
-    markdown = clean_output(result, True)
-
-    img_out = None
-    crops = []
-
-    if has_grounding and "<|ref|>" in result:
-        refs = extract_grounding_references(result)
-        if refs:
-            img_out, crops = draw_bounding_boxes(image, refs, True)
-
-    markdown = embed_images(markdown, crops)
-
-    return cleaned, markdown, result, img_out, crops
-
-#  PDF 
-@spaces.GPU(duration=60)
-def process_pdf(path, mode, task, custom_prompt, page_num):
-    doc = fitz.open(path)
-    total_pages = len(doc)
-
-    if page_num < 1 or page_num > total_pages:
-        doc.close()
-        return f"Invalid page number (PDF has {total_pages} pages)", "", "", None, []
-
-    page = doc.load_page(page_num - 1)
-    pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72), alpha=False)
-    img = Image.open(BytesIO(pix.tobytes("png")))
-    doc.close()
-
-    return process_image(img, mode, task, custom_prompt)
-
-#  FILE ROUTER 
-def process_file(path, mode, task, custom_prompt, page_num):
-    if not path:
-        return "Upload file", "", "", None, []
-    if path.lower().endswith(".pdf"):
-        return process_pdf(path, mode, task, custom_prompt, page_num)
-    return process_image(Image.open(path), mode, task, custom_prompt)
-
-#  UI HELPERS 
-def toggle_prompt(task):
-    if task == "✏️ Custom":
-        return gr.update(visible=True, label="Custom Prompt", placeholder="Use <|grounding|> for boxes")
-    elif task == "📍 Locate":
-        return gr.update(visible=True, label="Text to Locate")
-    return gr.update(visible=False)
-
-def select_boxes(task):
-    if task == "📍 Locate":
+def select_result_tab(task):
+    if task == "Locate":
         return gr.update(selected="tab_boxes")
     return gr.update()
 
-def get_pdf_page_count(file_path):
+def update_page_selector(file_path):
     if not file_path or not file_path.lower().endswith(".pdf"):
-        return 1
-    doc = fitz.open(file_path)
-    count = len(doc)
-    doc.close()
-    return count
+        return gr.update(visible=False, value=1)
+    page_count = document_service.page_count(file_path)
+    return gr.update(visible=True, minimum=1, maximum=page_count, value=1, label=f"PDF Page (1-{page_count})")
 
-def load_image(file_path, page_num=1):
+def preview_document(file_path, page_number=1):
     if not file_path:
         return None
-    if file_path.lower().endswith(".pdf"):
-        doc = fitz.open(file_path)
-        page_idx = max(0, min(int(page_num) - 1, len(doc) - 1))
-        page = doc.load_page(page_idx)
-        pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72), alpha=False)
-        img = Image.open(BytesIO(pix.tobytes("png")))
-        doc.close()
-        return img
-    return Image.open(file_path)
+    return document_service.load_page(file_path, int(page_number or 1))
 
-def update_page_selector(file_path):
-    if not file_path:
-        return gr.update(visible=False)
-    if file_path.lower().endswith(".pdf"):
-        page_count = get_pdf_page_count(file_path)
-        return gr.update(
-            visible=True,
-            maximum=page_count,
-            value=1,
-            minimum=1,
-            label=f"Select Page (1-{page_count})"
-        )
-    return gr.update(visible=False)
+def clear_outputs():
+    return (
+        None,  # preview image
+        gr.update(visible=False, value=1),  # page_selector
+        "",    # text_output
+        "",    # markdown_output
+        "",    # raw_output
+        None,  # boxes_output
+        []     # crops_output
+    )
 
-#  UI 
-with gr.Blocks(theme=gr.themes.Soft(), title="DeepSeek-OCR") as demo:
+@spaces.GPU(duration=60)
+def run_ocr(file_path, image_preview, mode, task, custom_prompt, page_number):
+    if image_preview is None and not file_path:
+        return "Please upload an image or PDF document first.", "", "", None, []
+    try:
+        image = image_preview or document_service.load_page(file_path, int(page_number or 1))
+        return ocr_service.infer(image, mode, task, custom_prompt or "").as_tuple()
+    except Exception as error:
+        return f"Processing failed: {error}", "", "", None, []
 
-    gr.Markdown("""
-    # 🚀 DeepSeek-OCR Demo
-    Upload a document (Image or PDF) to extract informations contain on an input.
+# CSS with Splash Screen & Smooth Entrance Animation
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+
+*, *::before, *::after {
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+    box-sizing: border-box;
+    transition: background-color 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+                border-color 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+                color 0.25s ease,
+                box-shadow 0.35s ease;
+}
+
+/* Splash / Loading Overlay */
+#app-splash-screen {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: #ffffff;
+    z-index: 99999;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    transition: opacity 0.5s cubic-bezier(0.4, 0, 0.2, 1), visibility 0.5s ease;
+}
+
+.dark #app-splash-screen {
+    background: #0b0f19;
+}
+
+#app-splash-screen.splash-hidden {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+/* Spinner Animation */
+.splash-spinner {
+    width: 52px;
+    height: 52px;
+    border: 4px solid rgba(2, 132, 199, 0.15);
+    border-top: 4px solid #0284c7;
+    border-radius: 50%;
+    animation: spin 0.85s linear infinite;
+    margin-bottom: 1.25rem;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+.splash-title {
+    font-size: 1.3rem;
+    font-weight: 700;
+    color: #0f172a;
+    letter-spacing: -0.02em;
+}
+
+.dark .splash-title {
+    color: #f8fafc;
+}
+
+/* Entrance Animation for the Entire App Container */
+.gradio-container {
+    max-width: 1440px !important;
+    width: 100% !important;
+    margin: 0 auto !important;
+    padding: 1.5rem !important;
+    animation: appEntrance 0.65s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes appEntrance {
+    0% {
+        opacity: 0;
+        transform: translateY(12px);
+    }
+    100% {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Header Container */
+.header-row {
+    background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%) !important;
+    border-radius: 14px !important;
+    padding: 1.5rem 2rem !important;
+    margin-bottom: 1.5rem !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    box-shadow: 0 8px 20px -4px rgba(2, 132, 199, 0.25) !important;
+    border: none !important;
+}
+
+.dark .header-row {
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%) !important;
+    border: 1px solid #334155 !important;
+    box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.5) !important;
+}
+
+.header-text h1 {
+    color: #ffffff !important;
+    font-size: 1.85rem !important;
+    font-weight: 800 !important;
+    margin: 0 0 0.35rem 0 !important;
+    letter-spacing: -0.03em !important;
+}
+
+.header-text p {
+    color: rgba(255, 255, 255, 0.88) !important;
+    font-size: 0.96rem !important;
+    margin: 0 !important;
+}
+
+/* Theme Toggle Button */
+#theme-toggle-btn {
+    width: 44px !important;
+    height: 44px !important;
+    min-width: 44px !important;
+    border-radius: 50% !important;
+    background: rgba(255, 255, 255, 0.18) !important;
+    backdrop-filter: blur(8px) !important;
+    -webkit-backdrop-filter: blur(8px) !important;
+    border: 1px solid rgba(255, 255, 255, 0.35) !important;
+    color: #ffffff !important;
+    font-size: 1.25rem !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    cursor: pointer !important;
+    padding: 0 !important;
+}
+
+#theme-toggle-btn:hover {
+    background: rgba(255, 255, 255, 0.3) !important;
+    transform: scale(1.08);
+}
+
+.theme-icon-animate {
+    animation: iconPopSpin 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+@keyframes iconPopSpin {
+    0% { transform: rotate(0deg) scale(0.7); opacity: 0.3; }
+    50% { transform: rotate(190deg) scale(1.15); }
+    100% { transform: rotate(360deg) scale(1); opacity: 1; }
+}
+
+/* Side-by-Side Dropdowns */
+.dropdown-pair-row {
+    display: flex !important;
+    flex-direction: row !important;
+    gap: 0.75rem !important;
+    align-items: flex-end !important;
+    width: 100% !important;
+}
+
+.dropdown-pair-row > div {
+    flex: 1 1 50% !important;
+    min-width: 0 !important;
+}
+
+/* Action Button */
+.extract-btn {
+    margin-top: 1rem !important;
+    font-weight: 600 !important;
+    border-radius: 8px !important;
+}
+
+.extract-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px -2px rgba(2, 132, 199, 0.3) !important;
+}
+
+footer {
+    display: none !important;
+}
+"""
+
+# JavaScript: Handles Theme Initialization and Smooth Splash Dissolve
+JS_THEME_AND_LOADER_INIT = """
+() => {
+    // 1. Synchronize Dark / Light mode based on preferences
+    const isDark = document.body.classList.contains('dark') || 
+                   (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    if (isDark) {
+        document.body.classList.add('dark');
+    }
+    const btn = document.querySelector('#theme-toggle-btn');
+    if (btn) {
+        btn.innerText = document.body.classList.contains('dark') ? '☀️' : '🌙';
+    }
+
+    // 2. Hide Splash Screen smoothly once UI has fully mounted
+    setTimeout(() => {
+        const splash = document.getElementById('app-splash-screen');
+        if (splash) {
+            splash.classList.add('splash-hidden');
+        }
+    }, 450);
+}
+"""
+
+JS_THEME_TOGGLE = """
+() => {
+    const isDark = document.body.classList.toggle('dark');
+    const btn = document.querySelector('#theme-toggle-btn');
+    if (btn) {
+        btn.innerText = isDark ? '☀️' : '🌙';
+        btn.classList.remove('theme-icon-animate');
+        void btn.offsetWidth;
+        btn.classList.add('theme-icon-animate');
+    }
+}
+"""
+
+with gr.Blocks(title="VisionDoc Studio | AI OCR & Document Intelligence") as demo:
+    # Fullscreen Splash Screen Overlay
+    gr.HTML("""
+    <div id="app-splash-screen">
+        <div class="splash-spinner"></div>
+        <div class="splash-title">VisionDoc Studio</div>
+    </div>
     """)
 
-    with gr.Row():
+    # Header Row
+    with gr.Row(elem_classes="header-row"):
+        with gr.Column(scale=10, elem_classes="header-text"):
+            gr.Markdown(
+                """
+                # VisionDoc Studio
+                Intelligent multimodal extraction — transform scans, PDF files, and images into structured Markdown.
+                """
+            )
+        with gr.Column(scale=1, min_width=50):
+            theme_toggle = gr.Button("🌙", elem_id="theme-toggle-btn")
+
+    theme_toggle.click(None, None, None, js=JS_THEME_TOGGLE)
+
+    with gr.Row(equal_height=False):
+        # Settings Column
         with gr.Column(scale=1):
-            with gr.Group():
-                file_in = gr.File(label="Upload Document", file_types=["image", ".pdf"], type="filepath")
-                
-                page_selector = gr.Number(label="Page", value=1, minimum=1, step=1, visible=False, precision=0)
-                
-                preview_img = gr.Image(label="Preview", type="pil", height=400, interactive=False)
-
-            mode = gr.Dropdown(list(MODEL_CONFIGS.keys()), value="Gundam", label="Mode")
-            task = gr.Dropdown(list(TASK_PROMPTS.keys()), value="📋 Markdown", label="Task")
-            prompt = gr.Textbox(label="Prompt", lines=2, visible=False)
-            btn = gr.Button("Extract", variant="primary", size="lg")
-
-        with gr.Column(scale=2):
-            with gr.Tabs() as tabs:
-                with gr.Tab("Text", id="tab_text"):
-                    text_out = gr.Textbox(lines=20, show_copy_button=True, show_label=False, interactive=True)
-                with gr.Tab("Markdown Preview", id="tab_md"):
-                    md_out = gr.Markdown("")
-                with gr.Tab("Boxes", id="tab_boxes"):
-                    img_out = gr.Image(type="pil", height=500, show_label=False)
-                with gr.Tab("Cropped Images", id="tab_crops"):
-                    gallery = gr.Gallery(show_label=False, columns=3, height=400)
-                with gr.Tab("Raw Text", id="tab_raw"):
-                    raw_out = gr.Textbox(lines=20, show_copy_button=True)
-
-    file_in.change(update_page_selector, [file_in], [page_selector])
-    file_in.change(load_image, [file_in, page_selector], [preview_img])
-    
-    page_selector.change(load_image, [file_in, page_selector], [preview_img])
-
-    text_out.change(lambda x: x, inputs=text_out, outputs=md_out)
-
-    task.change(toggle_prompt, [task], [prompt])
-    task.change(select_boxes, [task], [tabs])
-
-    def run(file_path, image_preview, mode, task, custom_prompt, page_num):
-        if image_preview is not None:
-             return process_image(image_preview, mode, task, custom_prompt)
-             
-        if file_path:
-            return process_file(file_path, mode, task, custom_prompt, int(page_num))
+            file_input = gr.File(
+                label="Document Upload",
+                file_types=["image", ".pdf"],
+                type="filepath",
+                file_count="single"
+            )
+            page_selector = gr.Number(
+                label="PDF Page",
+                value=1,
+                minimum=1,
+                step=1,
+                visible=False,
+                precision=0
+            )
+            preview = gr.Image(
+                label="Preview",
+                type="pil",
+                height=320,
+                interactive=False
+            )
             
-        return "Please upload a file first.", "", "", None, []
+            with gr.Row(elem_classes="dropdown-pair-row", equal_height=True):
+                mode = gr.Dropdown(
+                    choices=list(MODEL_CONFIGS),
+                    value="Gundam",
+                    label="Model Mode",
+                    info="Select resolution mode",
+                    allow_custom_value=False,
+                    filterable=False
+                )
+                task = gr.Dropdown(
+                    choices=list(TASK_PROMPTS),
+                    value="Markdown",
+                    label="OCR Task",
+                    info="Select extraction task",
+                    allow_custom_value=False,
+                    filterable=False
+                )
 
-    submit_event = btn.click(
-        run,
-        [file_in, preview_img, mode, task, prompt, page_selector],
-        [text_out, md_out, raw_out, img_out, gallery],
+            prompt = gr.Textbox(
+                label="Custom Prompt",
+                lines=3,
+                visible=False
+            )
+            
+            extract_button = gr.Button(
+                "Extract Content",
+                variant="primary",
+                size="lg",
+                elem_classes="extract-btn"
+            )
+
+        # Outputs Column (Clean state on initial load)
+        with gr.Column(scale=2):
+            with gr.Tabs() as result_tabs:
+                with gr.Tab("Editable Text", id="tab_text"):
+                    text_output = gr.Textbox(lines=22, show_label=False, value="")
+                with gr.Tab("Markdown Preview", id="tab_md"):
+                    markdown_output = gr.Markdown(value="")
+                with gr.Tab("Bounding Boxes", id="tab_boxes"):
+                    boxes_output = gr.Image(type="pil", height=520, show_label=False)
+                with gr.Tab("Cropped Figures", id="tab_crops"):
+                    crops_output = gr.Gallery(show_label=False, columns=3, height=420)
+                with gr.Tab("Raw Model Output", id="tab_raw"):
+                    raw_output = gr.Textbox(lines=22, show_label=False, value="")
+
+    # Event Listeners
+    file_input.change(update_page_selector, [file_input], [page_selector])
+    file_input.change(preview_document, [file_input, page_selector], [preview])
+    page_selector.change(preview_document, [file_input, page_selector], [preview])
+    
+    file_input.clear(
+        clear_outputs,
+        inputs=None,
+        outputs=[preview, page_selector, text_output, markdown_output, raw_output, boxes_output, crops_output]
     )
-    submit_event.then(select_boxes, [task], [tabs])
 
-#  LAUNCH 
+    task.change(update_prompt, [task], [prompt])
+    task.change(select_result_tab, [task], [result_tabs])
+    text_output.change(lambda text: text, [text_output], [markdown_output])
+
+    submit = extract_button.click(
+        run_ocr,
+        [file_input, preview, mode, task, prompt, page_selector],
+        [text_output, markdown_output, raw_output, boxes_output, crops_output],
+        show_progress="full",
+    )
+    submit.then(select_result_tab, [task], [result_tabs])
+
+    # Trigger splash fade-out and theme synchronization on page load
+    demo.load(None, None, None, js=JS_THEME_AND_LOADER_INIT)
+
 if __name__ == "__main__":
     demo.queue(max_size=20).launch(
-        share=True,
-        server_name="0.0.0.0",
-        server_port=7860
+        share=os.getenv("GRADIO_SHARE", "true").lower() == "true",
+        server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
+        server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")),
+        theme=gr.themes.Soft(),
+        css=CSS,
     )

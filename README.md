@@ -1,58 +1,71 @@
-# 🚀 DeepSeek-OCR Web UI
+# DeepSeek-OCR Studio
 
-A powerful and interactive Optical Character Recognition (OCR) web application powered by **DeepSeek-OCR**. This tool allows users to convert images and PDF documents into structured Markdown, extract raw text, and visually locate elements within documents using a modern Gradio interface.
+A Gradio web application powered by **DeepSeek-OCR** for converting images and PDF documents into editable text, Markdown, visual grounding boxes, and cropped figures.
 
-## ✨ Key Features
+## Features
 
-* **Multimodal Input:** Unified upload interface for both Images (`.jpg`, `.png`) and PDF documents (`.pdf`).
-* **Smart PDF Handling:** Automatically converts PDF pages to images with a built-in page selector.
-* **Interactive Editing:** Real-time text editor where changes to the extracted text are instantly reflected in the Markdown preview.
-* **Visual Grounding:** accurate bounding box visualization to locate specific text or elements within the image.
-* **Multiple Modes:** specialized configurations (e.g., *Gundam*, *Tiny*, *Base*) for different performance needs and image resolutions.
-* **Structured Output:** Generates clean Markdown with embedded cropped images for figures/charts.
+- Image and PDF upload with page selection and preview
+- Markdown conversion, free OCR, image description, text location, and custom prompts
+- Editable text output with a live Markdown preview
+- Bounding-box visualization and extracted figure crops
+- Safe grounding-coordinate parsing with `ast.literal_eval`
+- Lazy model loading and reliable temporary-file cleanup
+- Portable font selection without a hard-coded operating-system path
+- Client-side light and dark theme switching
 
-## 🛠️ Installation (Based on `DeepSeek-OCR` file)
+## Requirements
 
-1.  **Install dependencies:**
-    Ensure you have Python 3.8+ installed.
-    ```bash
-    pip install -r requirements.txt
-    apt-get install -y fonts-dejavu-core
-    ```
+- Python 3.10 or newer
+- A CUDA-compatible GPU is strongly recommended
+- Model weights are downloaded from Hugging Face during the first inference
+- Gradio 6.0 or newer
 
-    *Note: A GPU with CUDA support is highly recommended for reasonable inference speeds.*
+## Installation
 
-## 🚀 Usage
+```powershell
+python -m pip install -r requirements.txt
+```
 
-1.  Run the application:
-    ```bash
-    python app.py
-    ```
+## Run locally
 
-2.  Open your browser and navigate to the URLs provided in the terminal (public or local URL).
+```powershell
+$env:GRADIO_SHARE="false"
+python app.py
+```
 
-3.  **How to use:**
-    * **Upload:** Drop an image or PDF file in the input box.
-    * **Preview:** Use the page selector (for PDFs) to view specific pages.
-    * **Settings:** Choose the Model Mode (e.g., 'Gundam' for high detail) and Task (e.g., 'Markdown' or 'Locate').
-    * **Extract:** Click the "Extract" button.
-    * **Edit:** Go to the "Text" tab to refine the output; the "Markdown Preview" will update automatically.
+The default server address and port can be changed with `GRADIO_SERVER_NAME` and `GRADIO_SERVER_PORT`.
 
-## 📦 Requirements
+## Run in Google Colab
 
-Major dependencies include:
-* `torch` & `torchvision`
-* `transformers`
-* `gradio`
-* `PyMuPDF` (fitz)
-* `accelerate`
+Upload or clone this repository into the Colab runtime, then run the cells in `DeepSeek-OCR.ipynb` in order. The notebook searches below its current working directory for `requirements.txt` and `app.py`, so it does not depend on a fixed Colab path.
 
-See [requirements.txt](requirements.txt) for the full list.
+For a public Gradio link in Colab, set `GRADIO_SHARE=true` before running the application. The application uses port `7860` by default.
 
-## 🤖 Model
+## Project structure
 
-<<<<<<< HEAD
-This application uses *DeepSeek-OCR*, a specialized multimodal model designed for high-accuracy text extraction and document understanding.
-=======
-This application uses *DeepSeek-OCR*, a specialized multimodal model designed for high-accuracy text extraction and document understanding.
->>>>>>> f69c3dbc9ec093819cec1ead439318116a2c19a0
+```text
+.
+├── app.py
+├── ocr_core/
+│   ├── config.py
+│   ├── document_service.py
+│   ├── font.py
+│   ├── model_service.py
+│   └── output_formatter.py
+├── DeepSeek-OCR.ipynb
+├── requirements.txt
+└── README.md
+```
+
+`app.py` owns the Gradio composition and event wiring. The `ocr_core` package separates configuration, document I/O, model inference, font loading, and output formatting so each responsibility can be tested and changed independently.
+
+## Usage
+
+1. Upload an image or PDF document.
+2. Select a PDF page when applicable.
+3. Select a model mode and task.
+4. Enter a prompt for `Locate` or `Custom` tasks when requested.
+5. Click `Extract text`.
+6. Review or edit the text, Markdown, raw output, boxes, and cropped figures.
+
+For custom grounding output, include `<|grounding|>` in the custom prompt.
