@@ -43,7 +43,6 @@ For a public Gradio link in Colab, set `GRADIO_SHARE=true` before running the ap
 
 ## Project structure
 
-<<<<<<< HEAD
 ```text
 .
 ├── app.py
@@ -69,7 +68,4 @@ For a public Gradio link in Colab, set `GRADIO_SHARE=true` before running the ap
 5. Click `Extract text`.
 6. Review or edit the text, Markdown, raw output, boxes, and cropped figures.
 
-For custom grounding output, include `<|grounding|>` in the custom prompt.
-=======
 This application uses *DeepSeek-OCR*, a specialized multimodal model designed for high-accuracy text extraction and document understanding.
->>>>>>> 172f738cc54db899bea06a2103489c9c01459adc
