@@ -2,6 +2,8 @@
 
 A Gradio web application powered by **DeepSeek-OCR** for converting images and PDF documents into editable text, Markdown, visual grounding boxes, and cropped figures.
 
+![VisionDoc Studio preview](images/Core_Cover.jpg)
+
 ## Features
 
 - Image and PDF upload with page selection and preview
